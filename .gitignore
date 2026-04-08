@@ -1,0 +1,27 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Large data & derived artifacts (regenerate via preprocessing)
+data/*.hdf5
+preprocessed/*.npz
+preprocessed/*.joblib
+
+# Training outputs
+checkpoints/
+checkpoints_smoke/
+
+# Hugging Face / torch cache (if created under project)
+.cache/
