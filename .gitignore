@@ -16,6 +16,8 @@ build/
 
 # Large data & derived artifacts (regenerate via preprocessing)
 data/*.hdf5
+sessions/
+preprocessed_sessions/
 preprocessed/*.npz
 preprocessed/*.joblib
 

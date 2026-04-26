@@ -1,87 +1,93 @@
 """
-LILA-style latent action model for EMG teleoperation (structure only).
+LILA-style latent action model for EMG teleoperation (structure aligned with ``lila/src/models/film.py``).
 
-Components (see proposal):
-  - ActionEncoder E_a: (hand_state, hand_velocity) -> 2D latent. No language.
-  - EMGNetwork f_emg: EMG window (320) -> 2D latent.
-  - ActionDecoder D: (hand_state, latent, language_embedding) -> synergy velocity;
-    hidden layers use FiLM conditioning from language.
+Components:
+  - ActionEncoder E_a: (hand_state, hand_velocity) + language -> latent via FiLM on hidden (GELU MLPs).
+  - EMGNetwork f_emg: EMG window / features -> latent (same space as encoder; ReLU MLP — joystick replacement).
+  - ActionDecoder D: (hand_state, latent) + language -> synergy velocity via FiLM on hidden (GELU MLPs).
 
-Training stages are implemented elsewhere; this module only defines ``nn.Module``s.
+Training stages are implemented in ``train_teleop.py``.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-class FiLM(nn.Module):
-    """Map language embedding to per-feature scale and shift (gamma, beta)."""
-
-    def __init__(self, language_dim: int, feature_dim: int, hidden_dim: int | None = None):
-        super().__init__()
-        h = hidden_dim if hidden_dim is not None else feature_dim
-        self.net = nn.Sequential(
-            nn.Linear(language_dim, h),
-            nn.ReLU(inplace=True),
-            nn.Linear(h, 2 * feature_dim),
-        )
-        self.feature_dim = feature_dim
-
-    def forward(self, language_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            language_embedding: (batch, language_dim)
-        Returns:
-            gamma, beta each (batch, feature_dim)
-        """
-        gb = self.net(language_embedding)
-        gamma, beta = gb.split(self.feature_dim, dim=-1)
-        return gamma, beta
 
 
 class ActionEncoder(nn.Module):
     """
-    E_a: compress current synergy state + ground-truth synergy velocity to a 2D latent.
-    Used only in training (Stage 1 target for EMG; Stage 2 teacher). Does not see language.
+    FiLM-GeLU encoder matching ``lila.src.models.film.FiLM`` encoder arm:
+
+    ``enc2film``: (hand_state ‖ hand_velocity) -> hidden, then language generates (gamma, beta) via
+    ``enc_film_gen`` + ``efg`` / ``efb``, FiLM on hidden, then ``film2latent`` -> latent.
     """
 
     def __init__(
         self,
         synergy_dim: int,
         latent_dim: int = 2,
+        language_dim: int = 768,
         hidden_dim: int = 256,
-        num_hidden: int = 2,
+        use_language: bool = True,
     ):
         super().__init__()
         self.synergy_dim = synergy_dim
         self.latent_dim = latent_dim
-        in_dim = 2 * synergy_dim
-        layers: list[nn.Module] = []
-        d = in_dim
-        for _ in range(num_hidden):
-            layers += [nn.Linear(d, hidden_dim), nn.ReLU(inplace=True)]
-            d = hidden_dim
-        layers.append(nn.Linear(d, latent_dim))
-        self.mlp = nn.Sequential(*layers)
+        self.language_dim = language_dim
+        self.hidden_dim = hidden_dim
+        self.use_language = use_language
 
-    def forward(self, hand_state: torch.Tensor, hand_velocity: torch.Tensor) -> torch.Tensor:
+        in_dim = 2 * synergy_dim
+        self.enc_film_gen = nn.Sequential(
+            nn.Linear(language_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.efg = nn.Linear(hidden_dim, hidden_dim)
+        self.efb = nn.Linear(hidden_dim, hidden_dim)
+
+        self.enc2film = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.film2latent = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(
+        self,
+        hand_state: torch.Tensor,
+        hand_velocity: torch.Tensor,
+        language_embedding: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             hand_state: (batch, synergy_dim)
             hand_velocity: (batch, synergy_dim)
+            language_embedding: (batch, language_dim); required if ``use_language``
         Returns:
             latent: (batch, latent_dim)
         """
+        if self.use_language and language_embedding is None:
+            raise ValueError("language_embedding is required when use_language=True")
         x = torch.cat([hand_state, hand_velocity], dim=-1)
-        return self.mlp(x)
+        to_film = self.enc2film(x)
+        if self.use_language:
+            film_emb = self.enc_film_gen(language_embedding)  # type: ignore[arg-type]
+            gamma, beta = self.efg(film_emb), self.efb(film_emb)
+            h = gamma * to_film + beta
+        else:
+            h = to_film
+        return self.film2latent(h)
 
 
 class EMGNetwork(nn.Module):
     """
-    f_emg: EMG window flattened (8 * 40 = 320) -> 2D latent (same space as ActionEncoder).
+    f_emg: EMG window flattened -> latent (same space as ActionEncoder). Unchanged (joystick replacement).
     """
 
     def __init__(
@@ -116,8 +122,10 @@ class EMGNetwork(nn.Module):
 
 class ActionDecoder(nn.Module):
     """
-    D: (hand_state, latent) -> synergy velocity; language_embedding modulates hidden
-    activations via FiLM. Set ``use_language=False`` for a no-FiLM baseline (same MLP width).
+    FiLM-GeLU decoder matching ``lila.src.models.film.FiLM`` decoder arm:
+
+    ``dec2film``: (hand_state ‖ latent) -> hidden, then language FiLM via ``dec_film_gen`` + ``dfg`` / ``dfb``,
+    then ``film2action`` -> synergy velocity.
     """
 
     def __init__(
@@ -126,7 +134,6 @@ class ActionDecoder(nn.Module):
         latent_dim: int = 2,
         language_dim: int = 768,
         hidden_dim: int = 256,
-        num_film_layers: int = 2,
         use_language: bool = True,
     ):
         super().__init__()
@@ -134,22 +141,25 @@ class ActionDecoder(nn.Module):
         self.latent_dim = latent_dim
         self.language_dim = language_dim
         self.hidden_dim = hidden_dim
-        self.num_film_layers = num_film_layers
         self.use_language = use_language
 
-        self.fc_in = nn.Linear(synergy_dim + latent_dim, hidden_dim)
-
-        if use_language:
-            self.films = nn.ModuleList(
-                FiLM(language_dim, hidden_dim, hidden_dim=hidden_dim) for _ in range(num_film_layers)
-            )
-        else:
-            self.films = None
-
-        self.fc_hidden = nn.ModuleList(
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_film_layers - 1)
+        self.dec2film = nn.Sequential(
+            nn.Linear(synergy_dim + latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.fc_out = nn.Linear(hidden_dim, synergy_dim)
+        self.dec_film_gen = nn.Sequential(
+            nn.Linear(language_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.dfg = nn.Linear(hidden_dim, hidden_dim)
+        self.dfb = nn.Linear(hidden_dim, hidden_dim)
+        self.film2action = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(hidden_dim, synergy_dim),
+        )
 
     def forward(
         self,
@@ -165,21 +175,17 @@ class ActionDecoder(nn.Module):
         Returns:
             velocity_hat: (batch, synergy_dim)
         """
+        if self.use_language and language_embedding is None:
+            raise ValueError("language_embedding is required when use_language=True")
+        y = torch.cat([hand_state, latent], dim=-1)
+        to_film = self.dec2film(y)
         if self.use_language:
-            if language_embedding is None:
-                raise ValueError("language_embedding is required when use_language=True")
-        x = torch.cat([hand_state, latent], dim=-1)
-        h = self.fc_in(x)
-
-        for i in range(self.num_film_layers):
-            if self.use_language and self.films is not None:
-                gamma, beta = self.films[i](language_embedding)
-                h = gamma * h + beta
-            h = F.relu(h, inplace=True)
-            if i < self.num_film_layers - 1:
-                h = self.fc_hidden[i](h)
-
-        return self.fc_out(h)
+            film_emb = self.dec_film_gen(language_embedding)  # type: ignore[arg-type]
+            gamma, beta = self.dfg(film_emb), self.dfb(film_emb)
+            h = gamma * to_film + beta
+        else:
+            h = to_film
+        return self.film2action(h)
 
 
 class LilaTeleopModel(nn.Module):
@@ -187,8 +193,8 @@ class LilaTeleopModel(nn.Module):
     Full graph: ``encoder``, ``emg``, ``decoder``.
 
     Typical forwards:
-      - Stage 1: z = encoder(s, v); v_hat = decoder(s, z, lang)
-      - Stage 2: z_star = encoder(s, v); z_emg = emg(emg_window); loss = ||z_emg - z_star||
+      - Stage 1: z = encoder(s, v, lang); v_hat = decoder(s, z, lang)
+      - Stage 2: z_star = encoder(s, v, lang); z_emg = emg(emg_window); loss = ||z_emg - z_star||
       - Inference (EMG path): z = emg(emg_window); v_hat = decoder(s, z, lang)
     """
 
@@ -199,9 +205,8 @@ class LilaTeleopModel(nn.Module):
         emg_dim: int = 320,
         language_dim: int = 768,
         hidden_dim: int = 256,
-        encoder_hidden_layers: int = 2,
         emg_hidden_layers: int = 2,
-        decoder_film_layers: int = 2,
+        encoder_use_language: bool = True,
         decoder_use_language: bool = True,
     ):
         super().__init__()
@@ -211,22 +216,33 @@ class LilaTeleopModel(nn.Module):
         self.language_dim = language_dim
 
         self.encoder = ActionEncoder(
-            synergy_dim, latent_dim, hidden_dim=hidden_dim, num_hidden=encoder_hidden_layers
+            synergy_dim=synergy_dim,
+            latent_dim=latent_dim,
+            language_dim=language_dim,
+            hidden_dim=hidden_dim,
+            use_language=encoder_use_language,
         )
         self.emg = EMGNetwork(
-            emg_dim=emg_dim, latent_dim=latent_dim, hidden_dim=hidden_dim, num_hidden=emg_hidden_layers
+            emg_dim=emg_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            num_hidden=emg_hidden_layers,
         )
         self.decoder = ActionDecoder(
             synergy_dim=synergy_dim,
             latent_dim=latent_dim,
             language_dim=language_dim,
             hidden_dim=hidden_dim,
-            num_film_layers=decoder_film_layers,
             use_language=decoder_use_language,
         )
 
-    def encode_action(self, hand_state: torch.Tensor, hand_velocity: torch.Tensor) -> torch.Tensor:
-        return self.encoder(hand_state, hand_velocity)
+    def encode_action(
+        self,
+        hand_state: torch.Tensor,
+        hand_velocity: torch.Tensor,
+        language_embedding: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.encoder(hand_state, hand_velocity, language_embedding)
 
     def emg_to_latent(self, emg_window: torch.Tensor) -> torch.Tensor:
         return self.emg(emg_window)
